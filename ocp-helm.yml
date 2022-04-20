@@ -1,0 +1,141 @@
+---
+- name: Deploy Helm Chart
+  hosts: all
+  gather_facts: false
+  vars:
+    kubeconfig_path: "/tmp/ansible.kubeconfig"
+    helm_repo_name: wildfly
+    helm_chart_url: "https://docs.wildfly.org/wildfly-charts"
+    helm_chart_ref: "wildfly/wildfly"
+    helm_app_name: my-app
+    helm_app_namespace: wildfly
+
+  tasks:
+    - name: Add Helm repo
+      kubernetes.core.helm_repository:
+        name: "{{ helm_repo_name }}"
+        repo_url: "{{ helm_chart_url }}"
+
+    - name: Deploy Wildfly chart inside wildfly namespace (and create it)
+      kubernetes.core.helm:
+        kubeconfig: "{{ kubeconfig_path }}"
+        name: "{{ helm_app_name }}"
+        chart_ref: "{{ helm_chart_ref }}"
+        release_namespace: "{{ helm_app_namespace }}"
+        create_namespace: true
+        values:
+          build:
+            uri: https://github.com/wildfly/quickstart.git
+            ref: 26.0.0.Final
+            contextDir: microprofile-config
+            mode: bootable-jar
+            env:
+            - name: MAVEN_ARGS_APPEND
+              # Use the bootable-jar-openshift profile to ensure that the application
+              # can be deployed on OpenShift but disable JKube as the image will be 
+              # built and deployed by this chart.
+              value: -Pbootable-jar-openshift -Djkube.skip=true
+          deploy:
+            replicas: 3
+            env:
+            - name: CONFIG_PROP
+              value: Hello from OpenShift!
+
+    - name: "Gather information about {{ helm_app_name }}"
+      kubernetes.core.helm_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        name: "{{ helm_app_name }}"
+        release_namespace: "{{ helm_app_namespace }}"
+
+    - name: "Wait till {{ helm_app_name }} deployment is ready"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: apps/v1
+        kind: Deployment
+        name: "{{ helm_app_name }}"
+        namespace: "{{ helm_app_namespace }}"
+        wait: yes
+        wait_sleep: 10
+        wait_timeout: 360
+      register: myapp_deployment_obj
+      until:
+        - myapp_deployment_obj.resources[0].status.readyReplicas is defined
+        - "myapp_deployment_obj.resources[0].status.replicas == \
+           myapp_deployment_obj.resources[0].status.readyReplicas"
+      retries: 12
+      delay: 10
+
+    - name: "Get the actual number of {{ helm_app_name }} replicas"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Pod
+        namespace: "{{ helm_app_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ helm_app_name }}"
+      register: myapp_pods_list
+
+    - name: "Build {{ helm_app_name }} pod list"
+      ansible.builtin.set_fact:
+        myapp_pods_names: "{{ myapp_pods_list | community.general.json_query('resources[*].metadata.name') }}"
+      until: myapp_pods_names | list | length > 0
+
+    - name: "Wait till {{ helm_app_name }} pods are running"
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Pod
+        name: "{{ item }}"
+        namespace: "{{ helm_app_namespace }}"
+      register: myapp_pod_obj
+      until:
+        - myapp_pod_obj.resources[0].status |
+           json_query('conditions[?type==`Initialized`].status') == ["True"]
+        - myapp_pod_obj.resources[0].status |
+           json_query('conditions[?type==`Ready`].status') == ["True"]
+        - myapp_pod_obj.resources[0].status |
+           json_query('conditions[?type==`ContainersReady`].status') == ["True"]
+        - myapp_pod_obj.resources[0].status |
+           json_query('conditions[?type==`PodScheduled`].status') == ["True"]
+      loop:
+        "{{ myapp_pods_names }}"
+      retries: 12
+      delay: 10
+
+    - name: "Gather information about {{ helm_app_name }} route" 
+      kubernetes.core.k8s_info:
+        kubeconfig: "{{ kubeconfig_path }}"
+        api_version: v1
+        kind: Route
+        name: "{{ helm_app_name }}"
+        namespace: "{{ helm_app_namespace }}"
+        label_selectors:
+          - "app.kubernetes.io/instance={{ helm_app_name }}"
+      register: myapp_route_obj
+
+    - name: "Get {{ helm_app_name }} route"
+      ansible.builtin.set_fact:
+        myapp_route_host: "{{ myapp_route_obj | json_query('resources[*].spec.host') }}"
+ 
+    - name: "Print {{ helm_app_name }} URL"
+      ansible.builtin.debug:
+        msg:
+          - "{{ helm_app_name }} URL: https://{{ myapp_route_host[0] }}"
+
+#    - name: Install Helm Plugin
+#      kubernetes.core.helm_plugin:
+#        kubeconfig: "{{ kubeconfig_path }}"
+#        plugin_path: https://github.com/adamreese/helm-env
+#        state: present
+
+#    - name: Gather Helm plugin info
+#      kubernetes.core.helm_plugin_info:
+#        kubeconfig: "{{ kubeconfig_path }}"
+#        plugin_name: env
+#      register: r
+
+#    - name: Print plugin version
+#      debug:
+#        msg: "{{ ( r.plugin_list | selectattr('name', 'equalto', plugin_name) | list )[0].version }}"
+#      vars:
+#        plugin_name: "env"
